@@ -2,8 +2,6 @@
 #include <stdlib.h>
 #include <sysexits.h>
 #include <sys/mman.h>
-#include <sys/types.h>
-#include <sys/stat.h>
 #include <fcntl.h>
 #include <string.h>
 
@@ -23,6 +21,10 @@ struct mail_part {
     char id[20];              /* id of the part */
 };
 
+extern int optind;
+static int debug = 0;
+
+
 static void parse_part(GMimeObject *parent, GMimeObject *part, gpointer rock)
 {
     //struct mail_part *prev = rock;
@@ -30,10 +32,11 @@ static void parse_part(GMimeObject *parent, GMimeObject *part, gpointer rock)
     json_object *node;
     const char *str;
 
-    /* debug */
-    fprintf(stdout, "%s> %s\n",
-            g_mime_object_get_content_type(parent) ? g_mime_content_type_to_string(g_mime_object_get_content_type(parent)) : "null",
-            g_mime_content_type_to_string(g_mime_object_get_content_type(part)));
+    if (debug) {
+        fprintf(stdout, "%s> %s\n",
+                g_mime_object_get_content_type(parent) ? g_mime_content_type_to_string(g_mime_object_get_content_type(parent)) : "null",
+                g_mime_content_type_to_string(g_mime_object_get_content_type(part)));
+    }
 
     if (GMIME_IS_MESSAGE_PART(part)) {
         /* message/rfc822 or message/news */
@@ -197,23 +200,49 @@ static void parse_mail(int fd, json_object **es_json_doc)
     *es_json_doc = rock.mail_tree;
 }
 
+static int usage(const char *name, int error)
+{
+    FILE *out = error ? stderr : stdout;
+
+    fprintf(out, "usage: %s [OPTIONS]... [FILE]\n", name);
+    fprintf(out, "Produce JSON for Elasticsearch from mail from FILE,"
+                 " or standard input, to standard output.\n");
+    fprintf(out, "\n");
+    fprintf(out, "  -d,     enable verbose mode\n");
+    fprintf(out, "  -h,     display this help and exit\n");
+    fprintf(out, "\n");
+    fprintf(out, "With no FILE, or when FILE is -, read standard input.\n");
+
+    error ? exit(EX_USAGE) : exit(0);
+}
 
 int main(int argc, char **argv)
 {
-    int fd;
-    struct stat sbuf;
+    int option, fd;
     json_object *es_json_doc = NULL;
 
-    if (argc <= 1) {
-        fprintf(stderr, "Missing email in argument of %s.\n", argv[0]);
-        exit(EX_USAGE);
+    while ((option = getopt(argc, argv, "dh")) != EOF) {
+        switch(option) {
+        case 'd':
+            debug = 1;
+            break;
+        case 'h':
+            usage(argv[0], 0);
+            break;
+        default:
+            usage(argv[0], 1);
+            break;
+        }
     }
 
-    if ((fd = open(argv[1], O_LARGEFILE, O_RDONLY)) == -1) {
-        fprintf(stderr, "Cannot open mail: %s: %m", argv[1]);
+    if (optind == argc || *argv[optind] == '-') { /* read from stdin */
+        fd = 0;
     }
-    if (fstat(fd, &sbuf) == -1) {
-        fprintf(stderr, "Cannot stat mail: %s: %m", argv[1]);
+    else {
+        if ((fd = open(argv[optind], O_LARGEFILE, O_RDONLY)) == -1) {
+            fprintf(stderr, "Cannot open mail: %s: %m", argv[1]);
+            exit(1);
+        }
     }
 
     g_mime_init(0);
@@ -224,6 +253,9 @@ int main(int argc, char **argv)
     }
 
     g_mime_shutdown();
+
+    if (debug)
+        fprintf(stdout, "--\n");
     fprintf(stdout, "%s", json_object_to_json_string_ext(es_json_doc, JSON_C_TO_STRING_PRETTY));
 
     return EXIT_SUCCESS;
