@@ -13,12 +13,12 @@
 enum part_type { MESSAGE_PART, MESSAGE_PARTIAL, MULTIPART, PART };
 
 struct mail_part {
-    json_object *mail_tree;     /* global mail tree in JSON */
+    struct json_object *mail_tree;     /* global mail tree in JSON */
     int depth;                  /* depth of the current part */
     int rank;                   /* rank of the current part in this depth */
     char id[20];                /* id of the curent part */
     GMimeObject *last_part;     /* the part (GMime) before this one */
-    const char *last_node;      /* the part (JSON) before this one */
+    char last_node[20];         /* the part (JSON) before this one */
 
 };
 
@@ -26,6 +26,10 @@ extern int optind;
 static int debug = 0;
 
 
+/*
+ * format the given part to JSON and add the node to the JSON tree.
+ * return the key of the JSON node in the tree
+ */
 static void format_part(GMimeObject *part, struct mail_part *info)
 {
     GMimeStream *outstream;
@@ -33,7 +37,7 @@ static void format_part(GMimeObject *part, struct mail_part *info)
     GMimeContentType *content_type;
     GByteArray *bodypart;
     GMimeDataWrapper *wrapper;
-    json_object *node;
+    struct json_object *node;
     const char *str;
 
     node = json_object_new_object();
@@ -110,11 +114,16 @@ static void format_part(GMimeObject *part, struct mail_part *info)
 static void parse_part(GMimeObject *parent, GMimeObject *part, gpointer rock)
 {
     struct mail_part *cur = rock;
+    GMimeContentType *content_type;
+    GMimeContentType *parent_content_type;
+
+    content_type = g_mime_object_get_content_type(part);
+    parent_content_type = g_mime_object_get_content_type(parent);
 
     if (debug) {
-        fprintf(stdout, "%s> %s\n",
-                g_mime_object_get_content_type(parent) ? g_mime_content_type_to_string(g_mime_object_get_content_type(parent)) : "null",
-                g_mime_content_type_to_string(g_mime_object_get_content_type(part)));
+        fprintf(stdout, "found... %s> %s ",
+                parent_content_type ? g_mime_content_type_to_string(parent_content_type) : "null",
+                g_mime_content_type_to_string(content_type));
     }
 
     if (GMIME_IS_MESSAGE_PART(part)) {
@@ -143,6 +152,17 @@ static void parse_part(GMimeObject *parent, GMimeObject *part, gpointer rock)
         }
         sprintf(cur->id, "part-%d.%d", cur->depth, ++(cur->rank));
 
+        if (debug)
+            fprintf(stdout, " [%s]", cur->id);
+
+        /* prefer the last part in a multipart alternative set */
+        if (g_mime_content_type_is_type(parent_content_type, "multipart", "alternative")
+            && parent != cur->last_part) {
+            if (debug)
+                fprintf(stdout, ", discard %s and give preference to this one", cur->last_node);
+            json_object_object_del(cur->mail_tree, cur->last_node);
+        }
+
         format_part(part, cur);
     }
     else {
@@ -150,19 +170,23 @@ static void parse_part(GMimeObject *parent, GMimeObject *part, gpointer rock)
     }
 
     cur->last_part = part;
+    snprintf(cur->last_node, 20, cur->id);
+
+    if (debug)
+        fprintf(stdout, "\n");
 }
 
 /*
  * Return a JSON document to send to Elasticsearch for indexing
  */
-static void parse_mail(int fd, json_object **es_json_doc)
+static void parse_mail(int fd, struct json_object **es_json_doc)
 {
     GMimeStream *mail_stream;
     GMimeParser *parser;
     GMimeMessage *message;
     InternetAddressList *recipients;
     InternetAddress *recipient;
-    json_object *json_rcpts;
+    struct json_object *json_rcpts;
     const char *str;
     int i;
     struct mail_part rock;
@@ -206,7 +230,7 @@ static void parse_mail(int fd, json_object **es_json_doc)
     *es_json_doc = rock.mail_tree;
 }
 
-static int usage(const char *name, int error)
+static void usage(const char *name, int error)
 {
     FILE *out = error ? stderr : stdout;
 
@@ -225,7 +249,7 @@ static int usage(const char *name, int error)
 int main(int argc, char **argv)
 {
     int option, fd;
-    json_object *es_json_doc = NULL;
+    struct json_object *es_json_doc = NULL;
 
     while ((option = getopt(argc, argv, "dh")) != EOF) {
         switch(option) {
@@ -246,7 +270,7 @@ int main(int argc, char **argv)
         fd = 0;
     }
     else {
-        if ((fd = open(argv[optind], O_LARGEFILE, O_RDONLY)) == -1) {
+        if ((fd = open(argv[optind], O_RDONLY)) == -1) {
             fprintf(stderr, "Cannot open mail: %s: %m", argv[1]);
             exit(1);
         }
