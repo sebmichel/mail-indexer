@@ -13,24 +13,103 @@
 enum part_type { MESSAGE_PART, MESSAGE_PARTIAL, MULTIPART, PART };
 
 struct mail_part {
-    json_object *mail_tree;   /* global mail tree in JSON */
-    json_object *current;     /* current part in JSON */
-    int level;                /* depth of the part */
-    int rank;                 /* rank of the part in the current depth */
-    enum part_type last_type; /* type of the part before this one */
-    char id[20];              /* id of the part */
+    json_object *mail_tree;     /* global mail tree in JSON */
+    int depth;                  /* depth of the current part */
+    int rank;                   /* rank of the current part in this depth */
+    char id[20];                /* id of the curent part */
+    GMimeObject *last_part;     /* the part (GMime) before this one */
+    const char *last_node;      /* the part (JSON) before this one */
+
 };
 
 extern int optind;
 static int debug = 0;
 
 
-static void parse_part(GMimeObject *parent, GMimeObject *part, gpointer rock)
+static void format_part(GMimeObject *part, struct mail_part *info)
 {
-    //struct mail_part *prev = rock;
-    struct mail_part *cur = rock;
+    GMimeStream *outstream;
+    GMimeStream *filtered_stream;
+    GMimeContentType *content_type;
+    GByteArray *bodypart;
+    GMimeDataWrapper *wrapper;
     json_object *node;
     const char *str;
+
+    node = json_object_new_object();
+    content_type = g_mime_object_get_content_type(part);
+
+    if (content_type != NULL) {
+        str = g_mime_content_type_to_string(content_type);
+        json_object_object_add(node, "content-type", json_object_new_string(str));
+    }
+    if ((str = g_mime_part_get_filename((GMimePart *)part)) != NULL) {
+        json_object_object_add(node, "filename", json_object_new_string(str));
+    }
+
+    /*
+     * prepare the output stream with filters
+     */
+    outstream = g_mime_stream_mem_new();
+    filtered_stream = g_mime_stream_filter_new(outstream);
+
+    /*
+     * filter text in UTF-8 and binary in base64
+     */
+    if (g_mime_content_type_is_type(content_type, "text", "*")) {
+        GMimeFilter *decode_filter;
+        GMimeFilter *charset_filter;
+        const char *charset;
+
+        /* default charset for text/plain is ASCII
+         * choose arbitrarily ISO-8859-1 for others */
+        charset = g_mime_content_type_get_parameter(content_type, "charset");
+        if (charset == NULL) {
+            if (g_mime_content_type_is_type(content_type, "text", "plain"))
+                charset = "ascii";
+            else
+                charset = "iso-8859-1";
+        }
+
+        decode_filter = g_mime_filter_basic_new(GMIME_CONTENT_ENCODING_8BIT, TRUE);
+        charset_filter = g_mime_filter_charset_new(charset, "UTF-8");
+        if (charset_filter == NULL)
+            fprintf(stderr, "[ERR] charset conversion is not possible from:%s to:UTF-8\n", charset);
+
+        g_mime_stream_filter_add(GMIME_STREAM_FILTER (filtered_stream), decode_filter);
+        g_mime_stream_filter_add(GMIME_STREAM_FILTER (filtered_stream), charset_filter);
+        g_object_unref(decode_filter);
+        g_object_unref(charset_filter);
+    }
+    else {
+        GMimeFilter *binary_filter = g_mime_filter_basic_new(GMIME_CONTENT_ENCODING_BASE64, TRUE);
+
+        g_mime_stream_filter_add(GMIME_STREAM_FILTER (filtered_stream), binary_filter);
+        g_object_unref(binary_filter);
+    }
+
+    /*
+     * apply filters
+     */
+    wrapper = g_mime_part_get_content_object(GMIME_PART(part));
+    g_mime_data_wrapper_write_to_stream(wrapper, filtered_stream);
+    g_mime_stream_flush(filtered_stream);
+    g_object_unref(filtered_stream);
+    g_mime_stream_reset(outstream);
+
+    /*
+     * add result to JSON tree
+     */
+    bodypart = g_mime_stream_mem_get_byte_array((GMimeStreamMem*) outstream);
+    json_object_object_add(node, "body",
+                           json_object_new_string_len((const char *)bodypart->data, (int)bodypart->len));
+    json_object_object_add(info->mail_tree, info->id, node);
+    g_object_unref(outstream);
+}
+
+static void parse_part(GMimeObject *parent, GMimeObject *part, gpointer rock)
+{
+    struct mail_part *cur = rock;
 
     if (debug) {
         fprintf(stdout, "%s> %s\n",
@@ -43,108 +122,34 @@ static void parse_part(GMimeObject *parent, GMimeObject *part, gpointer rock)
         GMimeMessage *message;
 
         message = g_mime_message_part_get_message((GMimeMessagePart *) part);
-        cur->last_type = MESSAGE_PART;
+        cur->last_part = part;
         g_mime_message_foreach(message, parse_part, cur);
     }
     else if (GMIME_IS_MESSAGE_PARTIAL(part)) {
         /* don't handle such very rare type of part */
-
-        cur->last_type = MESSAGE_PARTIAL;
     }
     else if (GMIME_IS_MULTIPART(part)) {
         /* multipart/mixed, multipart/alternative,
          * multipart/related, multipart/signed,
          * multipart/encrypted, etc... */
-
-        cur->last_type = MULTIPART;
     }
     else if (GMIME_IS_PART(part)) {
         /* a normal leaf part */
-        GMimeStream *outstream;
-        GMimeStream *filtered_stream;
-        GMimeContentType *content_type;
-        GByteArray *bodypart;
-        GMimeDataWrapper *wrapper;
 
-        if (cur->last_type == MULTIPART || cur->last_type == MESSAGE_PART) {
-            cur->level++;
+        if ((GMIME_IS_MULTIPART(parent) || GMIME_IS_MESSAGE_PART(parent))
+                && parent == cur->last_part) { /* enter in a new level */
+            cur->depth++;
             cur->rank = 0;
         }
-        sprintf(cur->id, "part-%d.%d", cur->level, ++(cur->rank));
+        sprintf(cur->id, "part-%d.%d", cur->depth, ++(cur->rank));
 
-        node = json_object_new_object();
-        content_type = g_mime_object_get_content_type(part);
-
-        if (content_type != NULL) {
-            str = g_mime_content_type_to_string(content_type);
-            json_object_object_add(node, "content-type", json_object_new_string(str));
-        }
-        if ((str = g_mime_part_get_filename((GMimePart *)part)) != NULL) {
-            json_object_object_add(node, "filename", json_object_new_string(str));
-        }
-
-        /*
-         * prepare the output stream with filters
-         */
-        outstream = g_mime_stream_mem_new();
-        filtered_stream = g_mime_stream_filter_new(outstream);
-
-        /*
-         * filter text in UTF-8 and binary in base64
-         */
-        if (g_mime_content_type_is_type(content_type, "text", "*")) {
-            GMimeFilter *decode_filter;
-            GMimeFilter *charset_filter;
-            const char *charset;
-
-            /* default charset for text/plain is ASCII
-             * choose arbitrarily ISO-8859-1 for others */
-            charset = g_mime_content_type_get_parameter(content_type, "charset");
-            if (charset == NULL) {
-                if (g_mime_content_type_is_type(content_type, "text", "plain"))
-                    charset = "ascii";
-                else
-                    charset = "iso-8859-1";
-            }
-
-            decode_filter = g_mime_filter_basic_new(GMIME_CONTENT_ENCODING_8BIT, TRUE);
-            charset_filter = g_mime_filter_charset_new(charset, "UTF-8");
-            if (charset_filter == NULL)
-                fprintf(stderr, "[ERR] charset conversion is not possible from:%s to:UTF-8\n", charset);
-
-            g_mime_stream_filter_add(GMIME_STREAM_FILTER (filtered_stream), decode_filter);
-            g_mime_stream_filter_add(GMIME_STREAM_FILTER (filtered_stream), charset_filter);
-            g_object_unref(decode_filter);
-            g_object_unref(charset_filter);
-        }
-        else {
-            GMimeFilter *binary_filter = g_mime_filter_basic_new(GMIME_CONTENT_ENCODING_BASE64, TRUE);
-
-            g_mime_stream_filter_add(GMIME_STREAM_FILTER (filtered_stream), binary_filter);
-            g_object_unref(binary_filter);
-        }
-
-        /*
-         * apply filters
-         */
-        wrapper = g_mime_part_get_content_object(GMIME_PART(part));
-        g_mime_data_wrapper_write_to_stream(wrapper, filtered_stream);
-        g_mime_stream_flush(filtered_stream);
-        g_object_unref(filtered_stream);
-        g_mime_stream_reset(outstream);
-
-        /*
-         * add result to JSON tree
-         */
-        bodypart = g_mime_stream_mem_get_byte_array((GMimeStreamMem*) outstream);
-        json_object_object_add(node, "body",
-                               json_object_new_string_len((const char *)bodypart->data, (int)bodypart->len));
-        json_object_object_add(cur->mail_tree, cur->id, node);
-        g_object_unref(outstream);
+        format_part(part, cur);
     }
     else {
         /* unknown part type ... */
     }
+
+    cur->last_part = part;
 }
 
 /*
@@ -172,7 +177,7 @@ static void parse_mail(int fd, json_object **es_json_doc)
 
     memset(&rock, 0, sizeof(struct mail_part));
     rock.mail_tree = json_object_new_object();
-    rock.level = 0;
+    rock.depth = 0;
 
     /* add message headers */
     if ((str = g_mime_message_get_sender(message)) != NULL) {
@@ -196,6 +201,7 @@ static void parse_mail(int fd, json_object **es_json_doc)
 
     /* add message parts */
     g_mime_message_foreach(message, parse_part, &rock);
+    g_object_unref(message);
 
     *es_json_doc = rock.mail_tree;
 }
@@ -235,6 +241,7 @@ int main(int argc, char **argv)
         }
     }
 
+    /* XXX gmime needs to seek and doesn't work with stdin */
     if (optind == argc || *argv[optind] == '-') { /* read from stdin */
         fd = 0;
     }
