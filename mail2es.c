@@ -116,6 +116,7 @@ static void format_part(GMimeObject *part, struct mail_part *info)
     GMimeDataWrapper *wrapper;
     struct json_object *node;
     const char *filename;
+    const char *field;
 
     content_type = g_mime_object_get_content_type(part);
     filename = g_mime_part_get_filename((GMimePart *)part);
@@ -161,12 +162,14 @@ static void format_part(GMimeObject *part, struct mail_part *info)
         g_mime_stream_filter_add(GMIME_STREAM_FILTER (filtered_stream), charset_filter);
         g_object_unref(decode_filter);
         g_object_unref(charset_filter);
+        field = "body";
     }
     else {
         GMimeFilter *binary_filter = g_mime_filter_basic_new(GMIME_CONTENT_ENCODING_BASE64, TRUE);
 
         g_mime_stream_filter_add(GMIME_STREAM_FILTER (filtered_stream), binary_filter);
         g_object_unref(binary_filter);
+        field = "file";
     }
 
     /* apply filters */
@@ -178,7 +181,7 @@ static void format_part(GMimeObject *part, struct mail_part *info)
 
     /* add result to JSON tree */
     bodypart = g_mime_stream_mem_get_byte_array((GMimeStreamMem*) outstream);
-    json_object_object_add(node, "body",
+    json_object_object_add(node, field,
                            json_object_new_string_len((const char *)bodypart->data, (int)bodypart->len));
     json_object_object_add(info->mail_tree, info->id, node);
     g_object_unref(outstream);
@@ -268,6 +271,7 @@ static void process_mail(int fd, struct json_object **es_json_doc)
     const char *str;
     int i;
     struct mail_part rock;
+    time_t date;
 
     //mail_stream = g_mime_stream_mmap_new(fd, PROT_READ, MAP_SHARED);
     mail_stream = g_mime_stream_fs_new(fd);
@@ -297,9 +301,8 @@ static void process_mail(int fd, struct json_object **es_json_doc)
     if ((str = g_mime_message_get_subject(message)) != NULL) {
         json_object_object_add(rock.mail_tree, "subject", json_object_new_string(str));
     }
-    if ((str = g_mime_message_get_date_as_string (message)) != NULL) {
-        json_object_object_add(rock.mail_tree, "date", json_object_new_string(str));
-    }
+    g_mime_message_get_date(message, &date, NULL);
+    json_object_object_add(rock.mail_tree, "date", json_object_new_int64(date));
 
     /* add message parts */
     g_mime_message_foreach(message, process_part, &rock);
@@ -348,7 +351,7 @@ int main(int argc, char **argv)
 
     g_mime_shutdown();
 
-    fprintf(stdout, "\n%s\n", json_object_to_json_string_ext(es_json_doc, JSON_C_TO_STRING_PRETTY));
+    fprintf(stdout, "%s\n", json_object_to_json_string_ext(es_json_doc, JSON_C_TO_STRING_PRETTY));
     return EXIT_SUCCESS;
 }
 

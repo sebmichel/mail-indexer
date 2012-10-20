@@ -9,11 +9,11 @@ CC = color-gcc
 LIBDEST=$(PREFIX)/lib
 HEADDEST=$(PREFIX)/include
 
-all: mail-indexer.o
-	${CC} $(LDFLAGS) mail-indexer.o -o mail-indexer
+all: mail2es.o
+	${CC} $(LDFLAGS) mail2es.o -o mail2es
 
-mail-indexer.o : mail-indexer.c
-	${CC} $(CFLAGS) mail-indexer.c
+mail2es.o : mail2es.c
+	${CC} $(CFLAGS) mail2es.c
 
 clean:
-	rm -f *.o mail-indexer
+	rm -f *.o mail2es
