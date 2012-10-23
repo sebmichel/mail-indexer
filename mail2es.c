@@ -9,15 +9,15 @@
 #include <gmime/gmime.h>
 #include <json.h>
 
-
+#define MAXPART_LEN    20
 struct mail_part {
-    struct json_object *mail_tree;     /* global mail tree in JSON */
-    int depth;                  /* depth of the current part */
-    int rank;                   /* rank of the current part in this depth */
-    char id[20];                /* id of the curent part */
-    GMimeObject *last_part;     /* the part (GMime) before this one */
-    char last_node[20];         /* the part (JSON) before this one */
+    int depth;                      /* depth of the current part */
+    int rank;                       /* rank of the current part in this depth */
+    int idx;                        /* rank of the current part in the JSON array */
+    struct json_object *jparts;     /* array of message parts in JSON */
 
+    char id[MAXPART_LEN];           /* id of the current part */
+    GMimeObject *last_part;         /* the part (GMime) before this one */
 };
 
 struct ct_type {
@@ -93,6 +93,7 @@ static int is_indexable(GMimeContentType *content_type, const char *filename)
     if (!content_type)
         return 0;
 
+    /* index only content types from the mappings list */
     while (mappings[++i].ct) {
         for (j = 0; mappings[i].ct[j].type; j++)
             if (g_mime_content_type_is_type(content_type,
@@ -105,7 +106,7 @@ static int is_indexable(GMimeContentType *content_type, const char *filename)
 }
 
 /*
- * Format the given part to JSON and add the node to the JSON tree.
+ * Format the given part to JSON and add the node to the JSON parts array.
  */
 static void format_part(GMimeObject *part, struct mail_part *info)
 {
@@ -125,6 +126,7 @@ static void format_part(GMimeObject *part, struct mail_part *info)
      * add headers of the part
      */
     node = json_object_new_object();
+    json_object_object_add(node, "part", json_object_new_string(info->id));
     json_object_object_add(node, "content-type",
                            json_object_new_string(g_mime_content_type_to_string(content_type)));
     if (filename)
@@ -162,7 +164,7 @@ static void format_part(GMimeObject *part, struct mail_part *info)
         g_mime_stream_filter_add(GMIME_STREAM_FILTER (filtered_stream), charset_filter);
         g_object_unref(decode_filter);
         g_object_unref(charset_filter);
-        field = "body";
+        field = "text";
     }
     else {
         GMimeFilter *binary_filter = g_mime_filter_basic_new(GMIME_CONTENT_ENCODING_BASE64, TRUE);
@@ -179,11 +181,11 @@ static void format_part(GMimeObject *part, struct mail_part *info)
     g_object_unref(filtered_stream);
     g_mime_stream_reset(outstream);
 
-    /* add result to JSON tree */
+    /* add result to the JSON arry */
     bodypart = g_mime_stream_mem_get_byte_array((GMimeStreamMem*) outstream);
     json_object_object_add(node, field,
                            json_object_new_string_len((const char *)bodypart->data, (int)bodypart->len));
-    json_object_object_add(info->mail_tree, info->id, node);
+    json_object_array_put_idx(info->jparts, info->idx++, node);
     g_object_unref(outstream);
 }
 
@@ -197,7 +199,7 @@ static void process_part(GMimeObject *parent, GMimeObject *part, gpointer rock)
     parent_content_type = g_mime_object_get_content_type(parent);
 
     if (debug) {
-        fprintf(stdout, "found... %*.s(%d)%s> %s ", 8*cur->depth, "", cur->depth,
+        fprintf(stdout, "found... %s> %s ",
                 parent_content_type ? g_mime_content_type_to_string(parent_content_type) : "null",
                 g_mime_content_type_to_string(content_type));
     }
@@ -223,7 +225,9 @@ static void process_part(GMimeObject *parent, GMimeObject *part, gpointer rock)
 
     /* a normal leaf part */
     else if (GMIME_IS_PART(part)) {
-        /* XXX Fix depth that must decrease on exit of multipart */
+        int remove_previous_part = 0;
+
+        /* XXX Fix depth that must decrease on end of multipart */
         if (GMIME_IS_MULTIPART(parent) || GMIME_IS_MESSAGE_PART(parent)) {
             /* enter in a new level */
             if (parent == cur->last_part) {
@@ -232,33 +236,41 @@ static void process_part(GMimeObject *parent, GMimeObject *part, gpointer rock)
             }
             /* prefer the last part in a multipart alternative set */
             else if (g_mime_content_type_is_type(parent_content_type, "multipart", "alternative")) {
-                if (debug)
-                    fprintf(stdout, "(which replace %s) ", cur->last_node);
-                json_object_object_del(cur->mail_tree, cur->last_node);
+                if (debug) {
+                    struct json_object *last;
+
+                    last = json_object_array_get_idx(cur->jparts,
+                                                     json_object_array_length(cur->jparts) - 1);
+                    fprintf(stdout, "(which replace %s) ", json_object_get_string(json_object_object_get(last, "part")));
+                }
+                remove_previous_part = 1;
             }
         }
-        sprintf(cur->id, "part-%d.%d", cur->depth, ++(cur->rank));
+        sprintf(cur->id, "%d.%d", cur->depth, ++(cur->rank));
 
         if (debug)
             fprintf(stdout, "[%s]", cur->id);
 
         /* don't index unknown part type or content-type not in the mappings list */
-        if (is_indexable(content_type, g_mime_part_get_filename((GMimePart *)part)))
+        if (is_indexable(content_type, g_mime_part_get_filename((GMimePart *)part))) {
+            if (remove_previous_part && cur->idx)
+                cur->idx--;
+
             format_part(part, cur);
+        }
     }
     else {
         /* unknown part type ... */
     }
 
     cur->last_part = part;
-    snprintf(cur->last_node, 20, cur->id);
 
     if (debug)
         fprintf(stdout, "\n");
 }
 
 /*
- * Return a JSON document ready to use with Elasticsearch
+ * Return a JSON document ready to index with Elasticsearch
  */
 static void process_mail(int fd, struct json_object **es_json_doc)
 {
@@ -267,11 +279,12 @@ static void process_mail(int fd, struct json_object **es_json_doc)
     GMimeMessage *message;
     InternetAddressList *recipients;
     InternetAddress *recipient;
-    struct json_object *json_rcpts;
+    struct json_object *jroot, *jrcpts;
     const char *str;
     int i;
     struct mail_part rock;
     time_t date;
+    char sdate[12];
 
     //mail_stream = g_mime_stream_mmap_new(fd, PROT_READ, MAP_SHARED);
     mail_stream = g_mime_stream_fs_new(fd);
@@ -282,33 +295,36 @@ static void process_mail(int fd, struct json_object **es_json_doc)
     g_object_unref(mail_stream);
 
     memset(&rock, 0, sizeof(struct mail_part));
-    rock.mail_tree = json_object_new_object();
+    jroot = json_object_new_object();
     rock.depth = 0;
 
     /* add message headers */
     if ((str = g_mime_message_get_sender(message)) != NULL) {
-        json_object_object_add(rock.mail_tree, "from", json_object_new_string(str));
+        json_object_object_add(jroot, "from", json_object_new_string(str));
     }
     if ((recipients = g_mime_message_get_all_recipients(message)) != NULL) {
-        json_rcpts = json_object_new_array();
+        jrcpts = json_object_new_array();
         for (i = 0; i < internet_address_list_length(recipients); i++) {
             recipient = internet_address_list_get_address(recipients, i);
-            json_object_array_add(json_rcpts,
+            json_object_array_add(jrcpts,
                                   json_object_new_string(internet_address_to_string(recipient, FALSE)));
         }
-        json_object_object_add(rock.mail_tree, "to", json_rcpts);
+        json_object_object_add(jroot, "to", jrcpts);
     }
     if ((str = g_mime_message_get_subject(message)) != NULL) {
-        json_object_object_add(rock.mail_tree, "subject", json_object_new_string(str));
+        json_object_object_add(jroot, "subject", json_object_new_string(str));
     }
     g_mime_message_get_date(message, &date, NULL);
-    json_object_object_add(rock.mail_tree, "date", json_object_new_int64(date));
+    sprintf(sdate, "%ld", date);
+    json_object_object_add(jroot, "date", json_object_new_string(sdate));
 
     /* add message parts */
+    rock.jparts = json_object_new_array();
     g_mime_message_foreach(message, process_part, &rock);
+    json_object_object_add(jroot, "body", rock.jparts);
     g_object_unref(message);
 
-    *es_json_doc = rock.mail_tree;
+    *es_json_doc = jroot;
 }
 
 
